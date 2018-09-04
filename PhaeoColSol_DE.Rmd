@@ -1,0 +1,766 @@
+---
+title: "Colonial v. Solitary Phaeocystis Gene Espression"
+author: "Maggi Brisbin"
+date: "May 7, 2018"
+output:
+  html_document:
+    number_sections: yes
+    theme: cerulean
+    toc: yes
+    toc_depth: 5
+    toc_float: yes
+  pdf_document:
+    toc: yes
+    toc_depth: '5'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(cache=TRUE, fig.path='figures/', fig.width=8, fig.height=5 )
+```
+
+Load Packages 
+```{r loadLibraries, message=FALSE}
+library("DESeq2") # Differential expression analysis suite
+library("ggplot2") # Plotting
+library("genefilter") # Filtering genes from high-throughput experiments
+library("gplots") # Plotting
+library("BiocParallel") # multicore distribution
+library("pheatmap") # Plotting
+library("stringi")
+library("edgeR")
+library(GOstats)
+library("GSEABase")
+library(tidyr)
+library( scales )
+library(ggrepel)
+library("shiny")
+library(plotly)
+library("wesanderson")
+library(clusterProfiler)
+library(DOSE)
+```
+#Load and Prepare Data
+Data is RSEM output when aligning to longest isoform from Eukaryote Only Trinity assembly
+```{r}
+`C1.genes` <- read.delim("C1.genes.results")
+`C2.genes` <- read.delim("C2.genes.results")
+`C3.genes` <- read.delim("C3.genes.results")
+`C4.genes` <- read.delim("C4.genes.results")
+`S1.genes` <- read.delim("S1.genes.results")
+`S2.genes` <- read.delim("S2.genes.results")
+`S3.genes` <- read.delim("S3.genes.results")
+`S4.genes` <- read.delim("S4.genes.results")
+```
+Trinity Assembly has 69,528 "genes"
+
+Make a data frame with the geneID and FPKM from each sample
+```{r}
+FPKM<- data.frame(C1.genes$gene_id,C1.genes$FPKM,C2.genes$FPKM,C3.genes$FPKM,C4.genes$FPKM,S1.genes$FPKM,S2.genes$FPKM,S3.genes$FPKM,S4.genes$FPKM)
+names(FPKM)<-c("gene_id","C1","C2","C3", "C4","S1","S2","S3", "S4")
+```
+Remove rows without at least one sample with FPKM >= 1
+```{r}
+row.names(FPKM)<- FPKM[[1]]
+FPKM<- FPKM[,(-1)]
+FPKM<-FPKM[apply(FPKM>=1,1,any),]
+```
+
+54,737 genes remaining
+
+Make a data frame with the geneID and the expected counts column from each sample
+```{r}
+Genes<- data.frame(C1.genes$gene_id,C1.genes$expected_count,C2.genes$expected_count,C3.genes$expected_count,C4.genes$expected_count, S1.genes$expected_count,S2.genes$expected_count,S3.genes$expected_count,S4.genes$expected_count)
+names(Genes)<-c("gene_id", "C1","C2","C3", "C4","S1","S2","S3", "S4")
+```
+Filter counts data frame to hold only the genes with >1 FPKM 
+```{r}
+Genes <- Genes[Genes$gene_id %in% row.names(FPKM),]
+```
+prepare matrices for DeSeq2
+```{r}
+counts <- Genes[,2:9]
+counts <- sapply(counts, as.integer)
+rownames(counts)<-Genes[ , 1] #gene names
+sampleName<-colnames(counts)
+phenotype<- c(rep("colonial",4), rep("solitary",4))
+replicate<- c(rep(1:4,2))
+sampleTable <-data.frame(row.names=sampleName, phenotype=phenotype, replicate=replicate)
+```
+Convert matrix to DeSeq2 object 
+```{r, message = FALSE}
+dds <- DESeqDataSetFromMatrix(countData = counts, colData = sampleTable, design = ~ phenotype)
+# Remove empty counts
+dds <- dds[ rowSums(counts(dds)) > 1, ]
+# Count data transformations
+rld <- rlog(dds, blind=TRUE)
+```
+# Data Exploration
+## Scatterplot
+plot sample 1 against sample 2, with and without rlog transformation
+```{r ScatterWithOutlier}
+par( mfrow = c( 1, 2 ) )
+dds <- estimateSizeFactors(dds)
+plot(log2(counts(dds, normalized=TRUE)[,2:3] + 1), pch=16, cex=0.3)
+plot(assay(rld)[,2:3], pch=16, cex=0.3)
+par( mfrow = c( 1, 1 ) )
+```
+
+## PCA
+```{r pcaWithOutlier}
+data1 <- plotPCA(rld, intgroup=c("phenotype"), returnData=TRUE)
+data1$group<-gsub(" : ","_",as.character(data1$group))
+percentVar1 <- round(100 * attr(data1, "percentVar"))
+wp1<- wes_palette("Cavalcanti1")
+wp2<- wes_palette("GrandBudapest1")
+
+PCA<-ggplot(data1, aes(PC1, PC2, group=factor(group), color= name, shape= factor(phenotype)))+
+  geom_point(size=9) +scale_shape_manual(
+    name="phenotype", values=c("C", "S"))+
+  scale_colour_manual(
+    name="sample", values= c(wp1[1:4], wp2[1:4])) +
+  xlab(paste0("PC1: ",percentVar1[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar1[2],"% variance")) +
+  theme_bw() +
+  theme(axis.line = element_line(colour = "black"),
+        panel.background = element_blank()) + theme(axis.title = element_text(size = 16),
+    legend.title=element_text(size=16, face = "bold"), 
+    legend.text=element_text(size=14))
+PCA
+#ggsave("PCA.png", device="png")
+```
+
+*C2 is an outlier, remove this sample.*
+But, first ... 
+## DE analysis WITH outlier
+Differential Expression Testing
+```{r}
+dds <- DESeq(dds)
+```
+summarize results
+```{r}
+res<- results(dds, contrast=c("phenotype", "colonial", "solitary"))
+res05<- results(dds, contrast=c("phenotype", "colonial", "solitary"), alpha=0.05)
+summary(res)
+summary(res05)
+```
+
+HeatPlot
+
+for 1000 most differentially expressed genes
+```{r HeatMapWithOutlier}
+pal <- wes_palette(name = "Zissou1", n=2000 , type= "continuous")
+topVarGenes <- head(order(rowVars(assay(rld)),decreasing=TRUE), 1000)
+mat <- assay(rld)[ topVarGenes, ]
+mat <- mat - rowMeans(mat)
+df <- as.data.frame(colData(rld)[,c("phenotype", "replicate")])
+labels_row <- c(rep("", 10000))
+pheatmap(mat, labels_row = labels_row, fontsize = 12, color = pal)
+```
+*C2 is not very similar to the rest of the colonial replicates or the solitary replicates*
+
+###Remove Outlier
+
+```{r, cache=TRUE}
+Genes<- Genes[,-(3)]
+counts <- Genes[,2:8]
+counts <- sapply(counts, as.integer)
+rownames(counts)<-Genes$gene_id #gene names
+sampleName<-colnames(counts)
+phenotype<- c(rep("colonial",3), rep("solitary",4))
+replicate<- c(1:3, 1:4)
+sampleTable <-data.frame(row.names=sampleName, phenotype=phenotype, replicate=replicate)
+dds <- DESeqDataSetFromMatrix(countData = counts, colData = sampleTable, design = ~ phenotype)
+dds <- dds[ rowSums(counts(dds)) > 1, ]
+rld <- rlog(dds, blind=TRUE)
+```
+
+### Scatterplot w/out Outlier
+```{r ScatterNOoutlier}
+par( mfrow = c( 1, 2 ) )
+dds <- estimateSizeFactors(dds)
+plot(log2(counts(dds, normalized=TRUE)[,2:3] + 1), pch=16, cex=0.3)
+plot(assay(rld)[,2:3], pch=16, cex=0.3)
+par( mfrow = c( 1, 1 ) )
+```
+**single-line** after outlier removal
+
+### PCA w/out Outlier
+```{r figure2A_pca}
+data1 <- plotPCA(rld, intgroup=c("phenotype"), returnData=TRUE)
+data1$group<-gsub(" : ","_",as.character(data1$group))
+percentVar1 <- round(100 * attr(data1, "percentVar"))
+
+pal<-wes_palette(name = "Zissou1", type="discrete")
+
+
+pca <- ggplot(data1, aes(PC1, PC2, group=factor(group), color= factor(group), shape=factor(group))) +
+  geom_point(size=7) +
+  scale_shape_manual(
+    name="phenotype",
+    values=c(rep(16,2),rep(17,2)) ) +
+  scale_colour_manual(
+    name="phenotype",
+    values=rep(c(pal[2],pal[3]),4) ) +
+  xlab(paste0("PC1: ",percentVar1[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar1[2],"% variance")) +
+  theme_bw() +
+  theme(axis.line = element_line(colour = "black"),
+        panel.background = element_blank()) + 
+  theme(text = element_text(size=20))
+
+pca
+
+#ggsave("pca.pdf", width = 8, height = 5, units = "in")
+```
+
+# Differential Expression Testing
+```{r}
+dea <- DESeq(dds)
+```
+summarize results
+```{r}
+res<- results(dea, contrast=c("phenotype", "colonial", "solitary"), alpha=0.05)
+summary(res)
+```
+```{r}
+head(res, n=2)
+```
+
+colonial was compared to solitary   
+(+) is upregulated in colonial cultures and (-) is downregulated in colonial cultures
+
+## MA Plot
+
+```{r MAplot}
+resLFC <- lfcShrink(dea, contrast=c("phenotype", "colonial", "solitary"), alpha=0.05)
+#png(filename = "MAplot.png", width = 8.44, height = 6.67, units = "in", res = 720)
+plot(log2(resLFC$baseMean), resLFC$log2FoldChange, col=ifelse(resLFC$padj < 0.05, "#F21A00","gray67"),main="MA Plot (padj<0.05, log2FC = ±1)",xlim=c(1,20),pch=20,cex=1,ylim=c(-12,12), ylab=expression(paste('log'[2], ' fold change')), xlab=expression(paste('log'[2]," mean of normalized counts")), cex.lab=1.2, cex.axis=1.3, cex.main=1.5)
+abline(h=c(-1,1), col="blue")
+#dev.off()
+```
+
+
+How many genes are significantly differentially expressed at p<0.05?
+Use padj (not p). `padj` is the p value adjusted for multiple comparisons using the Benjamini-Hochberg adjustment, which takes into account false discovery rate (FDR). 
+```{r}
+sum(res$padj < 0.05, na.rm=TRUE)
+```
+
+## Heatmap
+for 1000 most differentially expressed genes
+```{r}
+topVarGenes <- head(order(rowVars(assay(rld)),decreasing=TRUE), 1000)
+mat <- assay(rld)[ topVarGenes, ]
+mat <- mat - rowMeans(mat)
+df <- as.data.frame(colData(rld)[,c("phenotype", "replicate")])
+labels_row <- c(rep("", 10000))
+```
+
+`rlog` stands for regularized log and produces " transformed data on the log2 scale which has been normalized with respect to library size or other normalization factors"
+
+`assay(rld)` function extracts the matrix of normalized values
+
+The following is a heat map of the difference in transformed count for each sample from the mean transformed count for the "gene" across all samples: 
+
+```{r figure2b_heatmap}
+#pdf(file= "pheat.pdf")
+pal <- wes_palette(name = "Zissou1", n=2000 , type= "continuous")
+heat <- pheatmap(mat, labels_row = labels_row, fontsize = 20, color = pal) 
+heat
+#dev.off()
+```
+# DSYB and Alma plots
+```{r}
+goi <- c("TRINITY_DN85929_c2_g1_i4", "TRINITY_DN67928_c0_g2_i2", "TRINITY_DN51587_c0_g1_i1" , "TRINITY_DN90393_c0_g1_i4")
+stopifnot(all(goi %in% names(dea)))
+goi
+```
+
+```{r}
+tcounts <- t(log2((counts(dea[goi, ], normalized=TRUE, replaced=FALSE)+.5))) %>%
+  merge(colData(dea), ., by="row.names") %>%
+  gather(gene, expression, (ncol(.)-length(goi)+1):ncol(.))
+
+annots<-c(rep("P. parvum DSYB-like", 7), rep("P. fradulenta DSYB-like", 7), rep("Alma7-like", 7), rep("Alma4-like", 7))
+
+tcounts$annots <- annots
+tcounts$annots_f = factor(tcounts$annots, levels=c("P. parvum DSYB-like","P. fradulenta DSYB-like","Alma4-like","Alma7-like"))
+
+```
+
+```{r figure4_dysbAlma1}
+pal<-wes_palette(name = "Zissou1", type="discrete")
+colors<- c(pal[2],pal[3])
+
+DSYBalma1<- ggplot(tcounts, aes(phenotype, expression, fill=phenotype)) + 
+  geom_boxplot() + 
+  facet_wrap(~annots_f, scales="fixed") + 
+  labs(x="", 
+       y="Expression (log normalized counts)", 
+       fill="Phenotype", 
+       title="") + theme_bw() + scale_fill_manual(values= colors) + theme(text = element_text(size=19)) 
+
+DSYBalma1
+```
+
+```{r}
+#ggsave("DSYBalma1.pdf", width = 8, height = 5, units = "in")
+```
+
+
+# Pfam / GO Annotation 
+
+convert DE results to a data frame
+```{r}
+DEres <- as.data.frame(res)
+DEres$trinity <- row.names(DEres)
+sigDEgenes <- subset(DEres, padj < 0.05)
+sigDEgenes$trinity <- row.names(sigDEgenes)
+```
+
+Import Pfam annotation results from dammit and fix pfam annotation formatting to match that used in the pfam2go mapping file
+```{r}
+pfamannot<- read.csv("./../Dibsi.Dammit/longestIsos_pg_euk_seqs.fasta.dammit/pfam.csv", header = TRUE)
+pfamannot <- pfamannot[,-1]
+pfamannot$Dbxref <- stri_sub(pfamannot$Dbxref , from = 2, to = -2)
+pfamannot$Pfam <- gsub("\\..*","", pfamannot$Dbxref)
+```
+
+Import and format trinity ID to dammit transcript ID mapping file
+```{r, message = FALSE, warnings = FALSE}
+trinity2dammit <- read.csv("./../Dibsi.Dammit/longestIsos_pg_euk_seqs.fasta.dammit/longestIsos_pg_euk_seqs.fasta.dammit.namemap.csv", header = TRUE)
+trinity2dammit1 <- trinity2dammit %>%
+  separate(original, c("trinity"), sep = " ") 
+names(trinity2dammit1) <- c("trinity", "seqid")
+```
+Import and format pfam2go mapping file (downloaded from GO consortium)
+```{r, message=FALSE, warnings = FALSE}
+pfam2go <- read.delim("./../Dibsi.Dammit/longestIsos_pg_euk_seqs.fasta.dammit/pfam2go4R.txt", header = FALSE)
+pfam2go1 <- pfam2go %>%
+  separate(V1, c('V1_1', 'V1_2'), sep = '>') %>%
+  separate(V1_1, c("Pfam", "name"), sep = " ") %>%
+  separate(V1_2, c("GO_desc", "GO"), sep = ";")
+pfam2go1$GO <-stri_sub(pfam2go1$GO, from = 2)
+```
+
+Create transcript to GO reference 
+```{r}
+pfam1 <- merge(pfamannot, pfam2go1, by = "Pfam")
+pfam2<- merge(pfam1, trinity2dammit1, by ="seqid" )
+pfam3 <- merge(pfam2, sigDEgenes, by = "trinity")
+
+pfamUP <- pfam3[pfam3$log2FoldChange >0 & pfam3$padj <0.05,]
+
+pfam4<-merge(pfamannot, trinity2dammit1, by = "seqid")
+pfam5<-merge(pfam4, sigDEgenes, by = "trinity")
+```
+
+Create list of all upregulated GO terms 
+```{r}
+#write.table(data.frame(pfamUP$GO), file = "UPgo.txt", quote = FALSE, row.names=FALSE )
+```
+# GO term enrichment testing with GOstats
+ 
+format transcript to GO mapping for GOstats
+```{r, message = FALSE, results="hide"}
+GOdf <- data.frame(pfam2$trinity, pfam2$GO)
+GOdf$evidence <- "ISS"
+names(GOdf) <- c("isoform", "GO", "evidence")
+#reorder columns
+GOdf <- GOdf[,c("GO","evidence","isoform")]  
+GOdf$GO <- as.character(GOdf$GO)
+GOdf$isoform<- as.character(GOdf$isoform)
+goframe=GOFrame(GOdf)
+goAllFrame=GOAllFrame(goframe)
+gsc <- GeneSetCollection(goAllFrame, setType = GOCollection())
+```
+prepare universe gene set, up-regulated gene set, and down-regulated gene set
+```{r}
+#make list of all genes
+universe <-trinity2dammit1$trinity 
+#make list of upregulated genes
+sigDEup <- sigDEgenes[sigDEgenes$log2FoldChange >0,] 
+uplist <- sigDEup$trinity
+#make list of downregulated genes
+sigDEdown<- sigDEgenes[sigDEgenes$log2FoldChange <0,]
+downlist <- sigDEdown$trinity
+```
+
+## GOterm enrichment in up-regulated genes
+```{r}
+upregulated = hyperGTest(
+  GSEAGOHyperGParams(name = "Phaeo Colonies Upregged",
+                     geneSetCollection=gsc,geneIds = uplist,
+                     universeGeneIds=universe,ontology = "BP",pvalueCutoff = 0.05,conditional = FALSE,testDirection = "over"))
+
+upregulated
+htmlReport(upregulated, file="enrichedUPgostats.html")
+upgoterms <-data.frame(summary(upregulated))
+write.csv(upgoterms,"upgo.csv")
+```
+
+## GOterm enrichment in down-reguated genes
+```{r}
+downregulated = hyperGTest(
+  GSEAGOHyperGParams(name = "Phaeo Colonies DownRegged",
+                     geneSetCollection=gsc,geneIds = downlist,
+                     universeGeneIds=universe,ontology = "BP",pvalueCutoff = 0.05,conditional = FALSE,testDirection = "over"))
+
+downregulated
+htmlReport(downregulated, file = "enrichedDOWNdostats.html")
+downgoterms <- data.frame(summary(downregulated))
+write.csv(downgoterms,"downgo.csv")
+```
+
+
+## GO term Figure (Revigo) 
+
+```{r revigo, message = FALSE , warnings = FALSE}
+revigo.names <- c("term_ID","description","frequency_%","plot_X","plot_Y","plot_size","value","uniqueness","dispensability");
+revigo.data <- rbind(c("GO:0009611","response to wounding", 0.127,-2.088,-4.004, 4.212, 0.0000,0.897,0.000),
+                     c("GO:0019646","aerobic electron transport chain", 0.042, 1.185, 6.346, 3.726, 1.0000,0.835,0.000),
+                     c("GO:0023052","signaling", 6.765, 3.744, 5.649, 5.939, 1.0000,0.960,0.000),
+                     c("GO:0051641","cellular localization", 2.041, 6.184, 0.408, 5.418, 0.0000,0.810,0.000),
+                     c("GO:0065007","biological regulation",20.498, 4.473,-4.496, 6.420, 1.0000,0.966,0.000),
+                     c("GO:0071824","protein-DNA complex subunit organization", 0.238, 1.769,-6.584, 4.485, 0.0000,0.804,0.000),
+                     c("GO:0006487","protein N-linked glycosylation", 0.076,-5.511,-0.765, 3.992, 0.0000,0.848,0.025),
+                     c("GO:0010109","regulation of photosynthesis", 0.008,-3.113, 6.366, 2.992, 1.0000,0.821,0.034),
+                     c("GO:0006468","protein phosphorylation", 4.137,-6.655,-0.222, 5.725, 1.0000,0.826,0.054),
+                     c("GO:0051716","cellular response to stimulus", 9.561,-3.483,-4.855, 6.089, 1.0000,0.831,0.059),
+                     c("GO:0007154","cell communication", 7.219, 4.498, 6.936, 5.967, 1.0000,0.916,0.065),
+                     c("GO:0019321","pentose metabolic process", 0.131,-0.768, 1.188, 4.227, 1.0000,0.857,0.109),
+                     c("GO:0006793","phosphorus metabolic process",13.507,-5.763, 3.275, 6.239, 1.0000,0.893,0.115),
+                     c("GO:0007034","vacuolar transport", 0.133, 5.746,-0.821, 4.231, 0.0000,0.837,0.262),
+                     c("GO:0006413","translational initiation", 0.518,-6.262,-1.365, 4.823, 0.0000,0.860,0.268),
+                     c("GO:0015833","peptide transport", 0.298, 6.461,-1.084, 4.582, 0.0000,0.818,0.283),
+                     c("GO:0072511","divalent inorganic cation transport", 0.393, 6.739,-0.117, 4.702, 0.0000,0.814,0.292),
+                     c("GO:0046903","secretion", 0.810, 5.668, 1.006, 5.017, 0.0000,0.779,0.316),
+                     c("GO:0031323","regulation of cellular metabolic process",11.662,-3.033, 5.629, 6.175, 1.0000,0.757,0.322),
+                     c("GO:0010033","response to organic substance", 0.900,-3.199,-4.592, 5.062, 0.0000,0.873,0.324),
+                     c("GO:0016192","vesicle-mediated transport", 1.085, 6.849, 0.498, 5.144, 0.0000,0.814,0.327),
+                     c("GO:1901605","alpha-amino acid metabolic process", 3.625,-2.270, 0.920, 5.668, 0.0000,0.823,0.329),
+                     c("GO:0006508","proteolysis", 5.223,-6.657,-1.994, 5.826, 0.0000,0.897,0.335),
+                     c("GO:0045184","establishment of protein localization", 2.407, 6.385, 1.099, 5.490, 0.0000,0.764,0.361),
+                     c("GO:0043467","regulation of generation of precursor metabolites and energy", 0.030,-0.531, 6.701, 3.578, 1.0000,0.812,0.486),
+                     c("GO:0044085","cellular component biogenesis", 4.355, 0.620,-6.879, 5.747, 0.0000,0.833,0.490),
+                     c("GO:0006887","exocytosis", 0.210, 4.720, 1.113, 4.430, 0.0000,0.754,0.492),
+                     c("GO:0015693","magnesium ion transport", 0.086, 6.515, 1.992, 4.044, 0.0000,0.829,0.527),
+                     c("GO:0007010","cytoskeleton organization", 0.786, 1.251,-6.780, 5.004, 0.0000,0.805,0.563),
+                     c("GO:0006333","chromatin assembly or disassembly", 0.120, 2.094,-6.525, 4.188, 0.0000,0.804,0.572),
+                     c("GO:0006323","DNA packaging", 0.227, 0.977,-6.802, 4.465, 0.0000,0.811,0.587),
+                     c("GO:0019222","regulation of metabolic process",11.942,-2.367, 6.182, 6.185, 1.0000,0.811,0.619),
+                     c("GO:0042549","photosystem II stabilization", 0.005,-0.918, 6.559, 2.814, 1.0000,0.787,0.650),
+                     c("GO:0006796","phosphate-containing compound metabolic process",13.110,-6.717, 2.076, 6.226, 1.0000,0.870,0.664),
+                     c("GO:0046373","L-arabinose metabolic process", 0.044,-0.569, 0.759, 3.752, 1.0000,0.853,0.664),
+                     c("GO:1901700","response to oxygen-containing compound", 0.503,-2.856,-4.504, 4.810, 0.0000,0.877,0.675),
+                     c("GO:0050794","regulation of cellular process",18.840,-2.302, 6.469, 6.383, 1.0000,0.777,0.698));
+
+one.data <- data.frame(revigo.data);
+names(one.data) <- revigo.names;
+one.data <- one.data [(one.data$plot_X != "null" & one.data$plot_Y != "null"), ];
+one.data$plot_X <- as.numeric( as.character(one.data$plot_X) );
+one.data$plot_Y <- as.numeric( as.character(one.data$plot_Y) );
+one.data$plot_size <- as.numeric( as.character(one.data$plot_size) );
+one.data$frequency <- as.numeric( as.character(one.data$frequency) );
+one.data$uniqueness <- as.numeric( as.character(one.data$uniqueness) );
+one.data$dispensability <- as.numeric( as.character(one.data$dispensability) )
+
+ex <- one.data [ c(1,3,4,8,9,10,11,13:16,18,20,21,23, 26:30,  33,35,36), ]; 
+
+reviGOplot <- ggplot( data = one.data ) +
+  geom_point( aes( plot_X, plot_Y, colour = value), alpha = I(0.6), size =7) +
+  scale_colour_manual(values =c("#3B9AB2", "red"), labels= c("Down", "Up")) +
+  geom_point( aes(plot_X, plot_Y), shape = 21, fill = "transparent", colour = I (alpha ("black", 0.6) ), size = 7) +   scale_size_area() + scale_size( range=c(5, 30)) + theme_bw() +
+  geom_label_repel(data = ex, aes(plot_X, plot_Y, label = description), colour = I(alpha("black", 0.85)), size = 4, nudge_x = 0 , point.padding = 0.2, label.padding = 0.1)+ labs (y = "Axis 2", x = "Axis 1") +
+  theme(legend.key = element_blank()) + theme(text = element_text(size=16)) + theme(legend.title=element_blank())
+
+reviGOplot
+```
+save:
+```{r}
+ggsave("reviGOplot.pdf",  width = 8, height = 5, units = "in")
+```
+
+### Shiny Version
+
+To view interactive version, click [here](https://brisbin.shinyapps.io/shinycolsol/).
+
+# KEGG Pathway Annotation 
+
+convert DeSeq results to data frame:
+```{r}
+resDFa<- as.data.frame(res)
+dim(resDFa)
+```
+filter for significant genes:
+
+```{r}
+resDF <- subset(resDFa, padj < 0.05)
+dim(resDF)
+```
+
+Import KO data:
+```{r}
+ko<- read.csv('user_ko.csv', header = TRUE)
+ko$Phaeo1528_GeneID<-gsub("\\|.*","",as.character(ko$Phaeo1528_GeneID))
+ko<- ko[ko$KO != "",]
+length(ko)
+```
+
+How many are unique? 
+```{r}
+length(unique(ko$Phaeo1528_GeneID))
+```
+
+Merge KO data with significant Deseq2 results
+```{r}
+resDF$Phaeo1528_GeneID <- row.names(resDF)
+resDF<-merge(ko, resDF, by = 'Phaeo1528_GeneID')
+dim(resDF)
+```
+
+How many are unique? 
+```{r}
+length(unique(resDF$Phaeo1528_GeneID))
+```
+
+Make Data Frame with all annotated genes:
+```{r}
+resALL<- as.data.frame(res)
+resALL$Phaeo1528_GeneID <- row.names(resALL)
+resALL<-merge(ko, resALL, by = 'Phaeo1528_GeneID')
+dim(resALL)
+```
+
+Get universe paths:
+```{r, cache=TRUE, results='hide'}
+koslist<- resALL$KO
+paths <- character(length=0)
+for(i in 1:length(koslist)) {
+  pathway <- system(paste0("curl http://rest.kegg.jp/link/pathway/", koslist[[i]]), intern=TRUE)
+  if (pathway[[1]] == "") {
+    paths[[i]]<- "NA"
+  } else if (length(pathway) == 1) {
+    paths[[i]] <- stri_sub(pathway[[1]], 16)
+  } else {
+    l <- length(pathway)
+    paths[[i]] <- stri_sub(pathway[[2]], 16)
+  }
+}
+resALL$path<-paths
+```
+
+remove lines with pathway = NA
+```{r}
+resALLnoNA <- resALL[resALL$path != "NA",]
+resALLnoNA <- resALLnoNA[resALLnoNA$path !='PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN"',]
+dim(resALLnoNA)
+```
+
+how many unique pathways? 
+```{r}
+length(unique(resALL$path))
+```
+
+save results 
+```{r, cache=TRUE}
+#write.csv(resALL, file = "results.csv", row.names= FALSE )
+```
+
+# Kegg Enrichment 
+## Hypergeometric Test with Cluster Profiler
+### CP enrichment in upregulated Genes
+```{r}
+gene.data <- resALL[!duplicated(resALL$Phaeo1528_GeneID), ]
+row.names(gene.data) <- gene.data[[1]] 
+de.genes <- subset(gene.data, padj < 0.05)
+up.genes <-subset(de.genes, log2FoldChange > 1)
+up.genes.names <- row.names(up.genes)
+
+resALLnoNA <- resALL[resALL$path != "NA",]
+resALLnoNA <- resALLnoNA[resALLnoNA$path !='PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN"',]
+dim(resALLnoNA)
+genepathways <- data.frame(resALLnoNA$path, resALLnoNA$Phaeo1528_GeneID)
+names(genepathways)<-c("pathwayID", "geneID")
+universelist<- genepathways$geneID
+universe<-as.vector(universelist)
+length(universe)
+
+ko_up<- resALLnoNA[resALLnoNA$log2FoldChange > 0 & resALLnoNA$padj <= 0.05 ,]
+de<-ko_up$Phaeo1528_GeneID
+de<- as.vector(de)
+
+enrchd <- enricher(de, pvalueCutoff = 0.05, pAdjustMethod = "none", universe, TERM2GENE = genepathways )
+upedf<- data.frame(enrchd)
+
+kosup<- row.names(upedf)
+name <- character(length=0)
+class <- character(length=0) 
+
+for(i in 1:length(kosup)) {
+  pathway <- system(paste0("curl http://rest.kegg.jp/get/", kosup[[i]]), intern=TRUE)
+  name[[i]] <- pathway[[2]]
+  class[[i]] <-pathway[[3]]
+}
+
+upedf$name <- name
+upedf$class <- class
+
+write.csv(upedf, file = "keggEnrichment_UP_HyperGeo.csv", row.names = FALSE)
+```
+### CP enrichment in downregulated Genes
+```{r}
+ko_down<- resALLnoNA[resALLnoNA$log2FoldChange < 0 & resALLnoNA$padj <= 0.05 ,]
+de<-ko_down$Phaeo1528_GeneID
+de<- as.vector(de)
+
+enrchd <- enricher(de, pvalueCutoff = 0.05, pAdjustMethod = "none", universe, TERM2GENE = genepathways )
+downedf<- data.frame(enrchd)
+
+kosup<- row.names(downedf)
+name <- character(length=0)
+class <- character(length=0) 
+
+for(i in 1:length(kosup)) {
+  pathway <- system(paste0("curl http://rest.kegg.jp/get/", kosup[[i]]), intern=TRUE)
+  name[[i]] <- pathway[[2]]
+  class[[i]] <-pathway[[3]]
+}
+
+downedf$name <- name
+downedf$class <- class
+
+write.csv(downedf, file = "keggEnrichment_DOWN_HyperGeo.csv", row.names = FALSE)
+```
+
+## Linear Model Analysis with edgeR 
+make universe (list of all genes with KO)
+```{r}
+genepathways <- data.frame(resALLnoNA$Phaeo1528_GeneID, resALLnoNA$path)
+names(genepathways)<-c("geneID", "pathwayID")
+universelist<- genepathways$geneID
+universelist<-as.vector(universelist)
+length(universelist)
+```
+
+### edgeR enrichment in Upregulated Genes: 
+```{r}
+ko_up<- resALLnoNA[resALLnoNA$log2FoldChange > 0 & resALLnoNA$padj <= 0.05 ,]
+de<-ko_up$Phaeo1528_GeneID
+de<- as.vector(de)
+
+keggUP<-kegga(de, universe = universelist, species = NULL, species.KEGG = NULL, convert = FALSE,
+              gene.pathway = genepathways, pathway.names = NULL,
+              prior.prob = NULL, covariate=NULL, plot=FALSE)
+
+names(keggUP) <- c("Pathway", "N", "DE" , "p")
+keggUP$Pathway<-row.names(keggUP)
+```
+
+Make dataframe of significantly enriched pathways:
+```{r}
+KeggUpsig<- keggUP[keggUP$p < 0.05,]
+```
+
+get descriptions of significantly enriched upregulated pathways:
+```{r, cache = TRUE, results= 'hide'}
+kosup<- row.names(KeggUpsig)
+name <- character(length=0)
+class <- character(length=0) 
+
+for(i in 1:length(kosup)) {
+  pathway <- system(paste0("curl http://rest.kegg.jp/get/", kosup[[i]]), intern=TRUE)
+  name[[i]] <- pathway[[2]]
+  class[[i]] <-pathway[[3]]
+}
+
+KeggUpsig$name <- name
+KeggUpsig$class <- class
+```
+
+```{r}
+KeggUpsig[,1:5]
+```
+
+save results: 
+```{r}
+write.csv(KeggUpsig, file = "keggEnrichment_UP_n.csv", row.names = FALSE)
+```
+
+*Get descriptions of all pathways available for significantly upregulated gene* 
+
+Make dataframe of upregulated pathways without duplicated entries:
+```{r}
+KeggUpE<- keggUP[keggUP$DE != 0,]
+```
+
+how many? 
+```{r}
+dim(KeggUpE)
+```
+get descriptions of significantly enriched upregulated pathways:
+```{r, cache = TRUE, results= 'hide'}
+kosup<- row.names(KeggUpE)
+name <- character(length=0)
+class <- character(length=0) 
+
+for(i in 1:length(kosup)) {
+  pathway <- system(paste0("curl http://rest.kegg.jp/get/", kosup[[i]]), intern=TRUE)
+  name[[i]] <- pathway[[2]]
+  class[[i]] <-pathway[[3]]
+}
+
+KeggUpE$name <- name
+KeggUpE$class <- class
+```
+
+save:
+```{r}
+write.csv(KeggUpE , file = "upregulated_pathways_nonredundant_n.csv" , row.names = FALSE )
+```
+
+
+### edgeR enrichment in Downregulated Genes: 
+```{r}
+ko_down<- resALLnoNA[resALLnoNA$log2FoldChange < 0 & resALLnoNA$padj <= 0.05 ,]
+de<-ko_down$Phaeo1528_GeneID
+de<- as.vector(de)
+
+keggDOWN<-kegga(de, universe = universelist, species = NULL, species.KEGG = NULL, convert = FALSE,
+              gene.pathway = genepathways, pathway.names = NULL,
+              prior.prob = NULL, covariate=NULL, plot=FALSE)
+
+```
+
+```{r}
+names(keggDOWN) <- c("Pathway", "N", "DE" , "p")
+keggDOWN$Pathway<-row.names(keggDOWN)
+KeggDOWNsig<- keggDOWN[keggDOWN$p < 0.05,]
+dim(KeggDOWNsig)
+```
+
+get descriptions of significantly enriched downregulated pathways:
+```{r, cache = TRUE, results= 'hide'}
+kosup<- row.names(KeggDOWNsig)
+name <- character(length=0)
+class <- character(length=0) 
+
+for(i in 1:length(kosup)) {
+  pathway <- system(paste0("curl http://rest.kegg.jp/get/", kosup[[i]]), intern=TRUE)
+  name[[i]] <- pathway[[2]]
+  class[[i]] <-pathway[[3]]
+}
+
+KeggDOWNsig$name <- name
+KeggDOWNsig$class <- class
+```
+
+```{r}
+KeggDOWNsig[,1:5]
+```
+
+save:
+```{r}
+write.csv(KeggDOWNsig , file = "KeggDownsig.csv" , row.names = FALSE )
+```
+
