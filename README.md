@@ -1,4 +1,4 @@
 # ColSolPhaeo
 
 
-![workflow](https://maggimars.github.io/ColSolPhaeo/RNAseqWorkflow.html)
+![workflow](https://maggimars.github.io/ColSolPhaeo/RNAseqWorkflow.png)
